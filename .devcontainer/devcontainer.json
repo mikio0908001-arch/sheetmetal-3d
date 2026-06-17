@@ -1,0 +1,14 @@
+{
+  "name": "sheetmetal-3d",
+  "image": "mcr.microsoft.com/devcontainers/universal:2",
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": { "label": "preview", "onAutoForward": "openPreview" }
+  },
+  "postAttachCommand": "echo 'プレビュー: ターミナルで python3 -m http.server 8000 を実行 → 転送ポート8000を開く'",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-vscode.live-server"]
+    }
+  }
+}

@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>板金 図面→概形3D（なぞり）</title>
+<style>
+  :root { --bar:#1f2733; --accent:#2e7dd1; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; font-family: system-ui,-apple-system,"Segoe UI",sans-serif; }
+  body { display:flex; flex-direction:column; background:#eef1f4; }
+  header { background:var(--bar); color:#fff; padding:8px 12px; display:flex; gap:8px;
+           flex-wrap:wrap; align-items:center; font-size:14px; }
+  header b { font-size:15px; margin-right:6px; }
+  button { background:#3a4757; color:#fff; border:0; border-radius:6px; padding:7px 11px;
+           font-size:13px; cursor:pointer; }
+  button:hover { background:#4a5a6e; }
+  button.on { background:var(--accent); }
+  button.go { background:#2a9d5b; }
+  input[type=number]{ width:64px; padding:5px; border-radius:5px; border:1px solid #889; }
+  label{ font-size:13px; }
+  #status { background:#111a26; color:#cfe3ff; padding:6px 12px; font-size:13px; min-height:18px; }
+  main { flex:1; display:flex; min-height:0; }
+  .pane { flex:1; min-width:0; position:relative; }
+  .pane.left { background:#dfe4ea; border-right:2px solid #c2c9d2; overflow:auto; display:flex;
+               align-items:center; justify-content:center; }
+  #draw { max-width:100%; max-height:100%; cursor:crosshair; background:#fff; touch-action:none; }
+  #three { width:100%; height:100%; display:block; }
+  .drop { color:#5a6675; text-align:center; padding:24px; font-size:14px; }
+  @media (max-width:820px){ main{ flex-direction:column; } }
+</style>
+</head>
+<body>
+<header>
+  <b>板金 概形3D</b>
+  <input type="file" id="file" accept="image/*,.tif,.tiff">
+  <button id="mScale">① スケール</button>
+  <button id="mOutline">② 輪郭</button>
+  <button id="mHoles">③ 穴</button>
+  <button id="undo">↶ 戻る</button>
+  <button id="clear">クリア</button>
+  <label>板厚<input type="number" id="thk" value="2.3" step="0.1" min="0.1"> mm</label>
+  <button id="gen" class="go">3D生成 ▶</button>
+  <button id="export">GLB保存</button>
+</header>
+<div id="status">図面を読み込んでください（ドラッグ＆ドロップ可）。図面はこの端末内だけで処理され、サーバには送信されません。</div>
+<main>
+  <div class="pane left" id="leftPane">
+    <div class="drop" id="drop">ここに図面（PNG/JPG/TIF）をドラッグ＆ドロップ<br>または上の「ファイル選択」</div>
+    <canvas id="draw" hidden></canvas>
+  </div>
+  <div class="pane"><canvas id="three"></canvas></div>
+</main>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+
+// ---------- 状態 ----------
+let img = null, mode = null;
+let scalePts = [], pxPerMm = null;
+let outline = [], holes = [], holeDia = 14;
+let mesh = null;
+
+const cv = document.getElementById('draw');
+const ctx = cv.getContext('2d');
+const statusEl = document.getElementById('status');
+function setStatus(t){ statusEl.textContent = t; }
+
+// ---------- 画像読み込み（TIFはブラウザが表示できない場合があるので注意表示） ----------
+function loadFile(f){
+  const url = URL.createObjectURL(f);
+  const im = new Image();
+  im.onload = () => {
+    img = im;
+    const maxW = 1100, maxH = 850;
+    let s = Math.min(1, maxW/im.naturalWidth, maxH/im.naturalHeight);
+    cv.width = Math.round(im.naturalWidth*s);
+    cv.height = Math.round(im.naturalHeight*s);
+    cv.hidden = false;
+    document.getElementById('drop').style.display = 'none';
+    resetTrace();
+    redraw();
+    setStatus('読み込み完了。①スケール → 既知寸法の両端を2点クリックしてください。');
+  };
+  im.onerror = () => setStatus('この画像形式はブラウザで直接表示できません（TIFはPNG/JPGに変換してお試しください）。');
+  im.src = url;
+}
+document.getElementById('file').onchange = e => { if(e.target.files[0]) loadFile(e.target.files[0]); };
+const drop = document.getElementById('leftPane');
+['dragover','drop'].forEach(ev => drop.addEventListener(ev, e => e.preventDefault()));
+drop.addEventListener('drop', e => { if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+
+// ---------- モード切替 ----------
+function setMode(m){
+  mode = m;
+  for(const id of ['mScale','mOutline','mHoles']) document.getElementById(id).classList.remove('on');
+  if(m==='scale'){ document.getElementById('mScale').classList.add('on'); scalePts=[]; setStatus('①スケール: 既知寸法の両端を2点クリック。'); }
+  if(m==='outline'){ document.getElementById('mOutline').classList.add('on'); setStatus('②輪郭: 板の角を順にクリック。角を全部クリックしたら「3D生成」へ。'); }
+  if(m==='holes'){
+    document.getElementById('mHoles').classList.add('on');
+    const d = prompt('穴の直径 mm（複数の穴に共通。例外は後で）', holeDia);
+    if(d) holeDia = parseFloat(d);
+    setStatus(`③穴: 穴の中心をクリック（直径${holeDia}mm）。別径は一旦この値で置き、後で変更可。`);
+  }
+  redraw();
+}
+document.getElementById('mScale').onclick   = () => setMode('scale');
+document.getElementById('mOutline').onclick = () => setMode('outline');
+document.getElementById('mHoles').onclick   = () => setMode('holes');
+
+// ---------- クリック ----------
+function canvasXY(e){
+  const r = cv.getBoundingClientRect();
+  return { x:(e.clientX-r.left)*(cv.width/r.width), y:(e.clientY-r.top)*(cv.height/r.height) };
+}
+cv.addEventListener('click', e => {
+  if(!img) return;
+  const p = canvasXY(e);
+  if(mode==='scale'){
+    scalePts.push(p);
+    if(scalePts.length===2){
+      const dpx = Math.hypot(scalePts[1].x-scalePts[0].x, scalePts[1].y-scalePts[0].y);
+      const mm = parseFloat(prompt('この2点間の実寸 mm を入力（例 220）', ''));
+      if(mm>0){ pxPerMm = dpx/mm; setStatus(`スケール設定OK（${pxPerMm.toFixed(3)} px/mm）。次は②輪郭へ。`); }
+      else { scalePts=[]; setStatus('数値が不正です。①スケールをやり直してください。'); }
+      mode=null; document.getElementById('mScale').classList.remove('on');
+    }
+  } else if(mode==='outline'){
+    outline.push(p);
+  } else if(mode==='holes'){
+    holes.push({x:p.x, y:p.y, d:holeDia});
+  }
+  redraw();
+});
+
+// ---------- 戻る/クリア ----------
+document.getElementById('undo').onclick = () => {
+  if(mode==='outline') outline.pop();
+  else if(mode==='holes') holes.pop();
+  else if(mode==='scale') scalePts.pop();
+  redraw();
+};
+function resetTrace(){ scalePts=[]; pxPerMm=null; outline=[]; holes=[]; mode=null;
+  for(const id of ['mScale','mOutline','mHoles']) document.getElementById(id).classList.remove('on'); }
+document.getElementById('clear').onclick = () => { resetTrace(); redraw(); setStatus('クリアしました。①スケールから。'); };
+
+// ---------- 2D描画 ----------
+function redraw(){
+  if(!img) return;
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.drawImage(img,0,0,cv.width,cv.height);
+  // スケール線
+  if(scalePts.length){ ctx.strokeStyle='#e8b800'; ctx.lineWidth=2; ctx.beginPath();
+    scalePts.forEach((p,i)=> i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.stroke();
+    scalePts.forEach(p=>dot(p,'#e8b800')); }
+  // 輪郭
+  if(outline.length){ ctx.strokeStyle='#10b3c8'; ctx.lineWidth=2; ctx.beginPath();
+    outline.forEach((p,i)=> i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));
+    if(outline.length>2) ctx.closePath(); ctx.stroke();
+    outline.forEach(p=>dot(p,'#10b3c8')); }
+  // 穴
+  ctx.strokeStyle='#e0413a'; ctx.lineWidth=2;
+  holes.forEach(h=>{ const r = pxPerMm? h.d/2*pxPerMm : 5;
+    ctx.beginPath(); ctx.arc(h.x,h.y,r,0,Math.PI*2); ctx.stroke(); dot(h,'#e0413a'); });
+}
+function dot(p,c){ ctx.fillStyle=c; ctx.beginPath(); ctx.arc(p.x,p.y,3.5,0,Math.PI*2); ctx.fill(); }
+
+// ---------- three.js ----------
+const tcv = document.getElementById('three');
+const renderer = new THREE.WebGLRenderer({canvas:tcv, antialias:true});
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0xeef1f4);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100000);
+const controls = new OrbitControls(camera, tcv); controls.enableDamping = true;
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const dir = new THREE.DirectionalLight(0xffffff, 0.8); dir.position.set(1,1,2); scene.add(dir);
+const grid = new THREE.GridHelper(1000, 20, 0xbcc4cf, 0xd6dce3); grid.rotation.x = Math.PI/2; scene.add(grid);
+function resize(){ const w=tcv.clientWidth, h=tcv.clientHeight; renderer.setSize(w,h,false);
+  camera.aspect = w/Math.max(1,h); camera.updateProjectionMatrix(); }
+window.addEventListener('resize', resize); resize();
+(function loop(){ requestAnimationFrame(loop); controls.update(); renderer.render(scene,camera); })();
+
+function fitCamera(obj){
+  const box = new THREE.Box3().setFromObject(obj);
+  const sph = box.getBoundingSphere(new THREE.Sphere());
+  const d = sph.radius / Math.sin(THREE.MathUtils.degToRad(camera.fov/2));
+  camera.position.copy(sph.center).add(new THREE.Vector3(0.6,-0.8,1).normalize().multiplyScalar(d*1.4));
+  controls.target.copy(sph.center); camera.near = d/100; camera.far = d*100; camera.updateProjectionMatrix();
+}
+
+// ---------- 生成 ----------
+function toMM(){
+  const xs = outline.map(p=>p.x), ys = outline.map(p=>p.y);
+  const ox = Math.min(...xs), oy = Math.max(...ys);      // 原点=左下, y上向き
+  const out = outline.map(p=>[ (p.x-ox)/pxPerMm, (oy-p.y)/pxPerMm ]);
+  const hl  = holes.map(h=>({ x:(h.x-ox)/pxPerMm, y:(oy-h.y)/pxPerMm, d:h.d }));
+  return { out, hl };
+}
+document.getElementById('gen').onclick = () => {
+  if(!pxPerMm){ setStatus('先に①スケールを設定してください。'); return; }
+  if(outline.length<3){ setStatus('②輪郭を3点以上クリックしてください。'); return; }
+  const thk = parseFloat(document.getElementById('thk').value)||2.3;
+  const { out, hl } = toMM();
+  const shape = new THREE.Shape();
+  out.forEach((p,i)=> i?shape.lineTo(p[0],p[1]):shape.moveTo(p[0],p[1]));
+  hl.forEach(h=>{ const path=new THREE.Path(); path.absarc(h.x,h.y,h.d/2,0,Math.PI*2,true); shape.holes.push(path); });
+  const geo = new THREE.ExtrudeGeometry(shape, {depth:thk, bevelEnabled:false});
+  if(mesh){ scene.remove(mesh); mesh.geometry.dispose(); }
+  const mat = new THREE.MeshStandardMaterial({color:0x9aa6b2, metalness:0.25, roughness:0.6, side:THREE.DoubleSide});
+  mesh = new THREE.Mesh(geo, mat); scene.add(mesh);
+  fitCamera(mesh);
+  setStatus(`3D生成OK（輪郭${out.length}点・穴${hl.length}個・板厚${thk}mm）。右画面をドラッグで回転。`);
+};
+
+// ---------- GLB保存 ----------
+document.getElementById('export').onclick = () => {
+  if(!mesh){ setStatus('先に「3D生成」してください。'); return; }
+  new GLTFExporter().parse(mesh, out => {
+    const blob = new Blob([out], {type:'model/gltf-binary'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'model.glb'; a.click();
+  }, err => setStatus('GLB書き出し失敗: '+err), {binary:true});
+};
+</script>
+</body>
+</html>
