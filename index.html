@@ -33,7 +33,7 @@
 <body>
 <header>
   <b>板金 概形3D</b>
-  <input type="file" id="file" accept="image/*,.tif,.tiff">
+  <input type="file" id="file" accept="image/*,.tif,.tiff,.dxf">
   <button id="mScale">① スケール</button>
   <button id="mOutline">② 輪郭</button>
   <button id="mHoles">③ 穴</button>
@@ -46,7 +46,7 @@
 <div id="status">図面を読み込んでください（ドラッグ＆ドロップ可）。図面はこの端末内だけで処理され、サーバには送信されません。</div>
 <main>
   <div class="pane left" id="leftPane">
-    <div class="drop" id="drop">ここに図面（PNG/JPG/TIF）をドラッグ＆ドロップ<br>または上の「ファイル選択」</div>
+    <div class="drop" id="drop">ここに図面（PNG/JPG/TIF/DXF）をドラッグ＆ドロップ<br>または上の「ファイル選択」</div>
     <canvas id="draw" hidden></canvas>
   </div>
   <div class="pane"><canvas id="three"></canvas></div>
@@ -64,12 +64,14 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+import { parseDxf } from './src/dxf.js';
 
 // ---------- 状態 ----------
 let img = null, mode = null;
 let scalePts = [], pxPerMm = null;
 let outline = [], holes = [], holeDia = 14;
 let mesh = null;
+let dxfGeom = null;   // DXF読込時の {outline, holes, units...}（手動トレースとは別管理）
 
 const cv = document.getElementById('draw');
 const ctx = cv.getContext('2d');
@@ -78,6 +80,7 @@ function setStatus(t){ statusEl.textContent = t; }
 
 // ---------- 画像読み込み（PNG/JPGはそのまま、TIF/TIFFはUTIFで端末内デコード） ----------
 function setupImage(im){
+  dxfGeom = null;          // ラスター読込時はDXFモードを解除
   img = im;
   const maxW = 1100, maxH = 850;
   let s = Math.min(1, maxW/im.naturalWidth, maxH/im.naturalHeight);
@@ -92,6 +95,9 @@ function setupImage(im){
 
 function isTiff(f){
   return /image\/tiff/i.test(f.type||'') || /\.tiff?$/i.test(f.name||'');
+}
+function isDxf(f){
+  return /\.dxf$/i.test(f.name||'') || /dxf/i.test(f.type||'');
 }
 
 // TIF/TIFF をこの端末内だけでPNG相当に変換（UTIF使用・サーバへ送信しない）
@@ -125,6 +131,7 @@ async function loadTiff(f){
 }
 
 function loadFile(f){
+  if(isDxf(f)){ loadDxf(f); return; }
   if(isTiff(f)){ loadTiff(f); return; }
   const url = URL.createObjectURL(f);
   const im = new Image();
@@ -136,6 +143,53 @@ document.getElementById('file').onchange = e => { if(e.target.files[0]) loadFile
 const drop = document.getElementById('leftPane');
 ['dragover','drop'].forEach(ev => drop.addEventListener(ev, e => e.preventDefault()));
 drop.addEventListener('drop', e => { if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+
+// ---------- DXF読み込み（端末内でパース→外形/穴を抽出→そのまま3D。スケール校正は不要） ----------
+async function loadDxf(f){
+  try{
+    setStatus('DXFを解析中…（この端末内だけで処理。サーバには送信しません）');
+    const text = await f.text();
+    const g = parseDxf(text);
+    dxfGeom = g;
+    img = null;                       // ラスター無し（手動トレースは使わない）
+    resetTrace();
+    drawDxfPreview(g);
+    generateFromDxf();                // 3Dまで自動生成
+    const u = g.units === 'unknown' ? 'mm(仮定)' : g.units;
+    let msg = `DXF読込OK（単位 ${u}・外形1＋穴${g.holes.length}）。板厚を変えたら「3D生成 ▶」で再生成。`;
+    if(g.warnings.length) msg += ' ／ 注意: ' + g.warnings.join('、');
+    setStatus(msg);
+  }catch(e){
+    dxfGeom = null;
+    setStatus('DXFを解析できませんでした: ' + ((e && e.message) || e));
+  }
+}
+
+// 抽出した外形・穴を2Dキャンバスにフィット表示（確認用）
+function drawDxfPreview(g){
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+  const scan = pts => { for(const [x,y] of pts){ if(x<minX)minX=x; if(x>maxX)maxX=x; if(y<minY)minY=y; if(y>maxY)maxY=y; } };
+  scan(g.outline); g.holes.forEach(scan);
+  const w = (maxX-minX)||1, h = (maxY-minY)||1, margin = 24;
+  const s = Math.min((1100-2*margin)/w, (850-2*margin)/h);
+  cv.width  = Math.round(w*s + 2*margin);
+  cv.height = Math.round(h*s + 2*margin);
+  cv.hidden = false;
+  document.getElementById('drop').style.display = 'none';
+  const tx = x => margin + (x-minX)*s;
+  const ty = y => cv.height - margin - (y-minY)*s;   // mmのy上向き→canvasのy下向き
+  ctx.fillStyle='#fff'; ctx.fillRect(0,0,cv.width,cv.height);
+  ctx.strokeStyle='#10b3c8'; ctx.fillStyle='rgba(16,179,200,0.08)'; ctx.lineWidth=2;
+  ctx.beginPath();
+  g.outline.forEach((p,i)=> i?ctx.lineTo(tx(p[0]),ty(p[1])):ctx.moveTo(tx(p[0]),ty(p[1])));
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.strokeStyle='#e0413a';
+  for(const hole of g.holes){
+    ctx.beginPath();
+    hole.forEach((p,i)=> i?ctx.lineTo(tx(p[0]),ty(p[1])):ctx.moveTo(tx(p[0]),ty(p[1])));
+    ctx.closePath(); ctx.stroke();
+  }
+}
 
 // ---------- モード切替 ----------
 function setMode(m){
@@ -189,7 +243,17 @@ document.getElementById('undo').onclick = () => {
 };
 function resetTrace(){ scalePts=[]; pxPerMm=null; outline=[]; holes=[]; mode=null;
   for(const id of ['mScale','mOutline','mHoles']) document.getElementById(id).classList.remove('on'); }
-document.getElementById('clear').onclick = () => { resetTrace(); redraw(); setStatus('クリアしました。①スケールから。'); };
+document.getElementById('clear').onclick = () => {
+  if(dxfGeom){
+    dxfGeom = null;
+    if(mesh){ scene.remove(mesh); mesh.geometry.dispose(); mesh = null; }
+    ctx.clearRect(0,0,cv.width,cv.height);
+    cv.hidden = true; document.getElementById('drop').style.display = '';
+    setStatus('クリアしました。図面（画像 or DXF）を読み込んでください。');
+    return;
+  }
+  resetTrace(); redraw(); setStatus('クリアしました。①スケールから。');
+};
 
 // ---------- 2D描画 ----------
 function redraw(){
@@ -242,7 +306,40 @@ function toMM(){
   const hl  = holes.map(h=>({ x:(h.x-ox)/pxPerMm, y:(oy-h.y)/pxPerMm, d:h.d }));
   return { out, hl };
 }
+// Shape を押し出してメッシュ化（手動・DXF 共通）
+function buildMesh(shape, thk){
+  const geo = new THREE.ExtrudeGeometry(shape, {depth:thk, bevelEnabled:false});
+  if(mesh){ scene.remove(mesh); mesh.geometry.dispose(); }
+  const mat = new THREE.MeshStandardMaterial({color:0x9aa6b2, metalness:0.25, roughness:0.6, side:THREE.DoubleSide});
+  mesh = new THREE.Mesh(geo, mat); scene.add(mesh);
+  fitCamera(mesh);
+}
+
+// DXF（mm座標）→ THREE.Shape（原点寄せ：グリッド基準合わせ＆巨大座標の精度対策）
+function shapeFromDxf(g){
+  let minX=Infinity, minY=Infinity;
+  for(const [x,y] of g.outline){ if(x<minX)minX=x; if(y<minY)minY=y; }
+  const shape = new THREE.Shape();
+  g.outline.forEach((p,i)=> i?shape.lineTo(p[0]-minX,p[1]-minY):shape.moveTo(p[0]-minX,p[1]-minY));
+  for(const h of g.holes){
+    const path = new THREE.Path();
+    h.forEach((p,i)=> i?path.lineTo(p[0]-minX,p[1]-minY):path.moveTo(p[0]-minX,p[1]-minY));
+    shape.holes.push(path);
+  }
+  return shape;
+}
+function generateFromDxf(){
+  const thk = parseFloat(document.getElementById('thk').value)||2.3;
+  buildMesh(shapeFromDxf(dxfGeom), thk);
+}
+
 document.getElementById('gen').onclick = () => {
+  if(dxfGeom){
+    const thk = parseFloat(document.getElementById('thk').value)||2.3;
+    generateFromDxf();
+    setStatus(`DXFから3D生成OK（外形${dxfGeom.outline.length}点・穴${dxfGeom.holes.length}個・板厚${thk}mm）。右画面をドラッグで回転。`);
+    return;
+  }
   if(!pxPerMm){ setStatus('先に①スケールを設定してください。'); return; }
   if(outline.length<3){ setStatus('②輪郭を3点以上クリックしてください。'); return; }
   const thk = parseFloat(document.getElementById('thk').value)||2.3;
@@ -250,11 +347,7 @@ document.getElementById('gen').onclick = () => {
   const shape = new THREE.Shape();
   out.forEach((p,i)=> i?shape.lineTo(p[0],p[1]):shape.moveTo(p[0],p[1]));
   hl.forEach(h=>{ const path=new THREE.Path(); path.absarc(h.x,h.y,h.d/2,0,Math.PI*2,true); shape.holes.push(path); });
-  const geo = new THREE.ExtrudeGeometry(shape, {depth:thk, bevelEnabled:false});
-  if(mesh){ scene.remove(mesh); mesh.geometry.dispose(); }
-  const mat = new THREE.MeshStandardMaterial({color:0x9aa6b2, metalness:0.25, roughness:0.6, side:THREE.DoubleSide});
-  mesh = new THREE.Mesh(geo, mat); scene.add(mesh);
-  fitCamera(mesh);
+  buildMesh(shape, thk);
   setStatus(`3D生成OK（輪郭${out.length}点・穴${hl.length}個・板厚${thk}mm）。右画面をドラッグで回転。`);
 };
 
