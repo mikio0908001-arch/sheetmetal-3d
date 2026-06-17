@@ -37,6 +37,7 @@
   <button id="mScale">① スケール</button>
   <button id="mOutline">② 輪郭</button>
   <button id="mHoles">③ 穴</button>
+  <button id="mBend">④ 曲げ</button>
   <button id="undo">↶ 戻る</button>
   <button id="clear">クリア</button>
   <label>板厚<input type="number" id="thk" value="2.3" step="0.1" min="0.1"> mm</label>
@@ -65,13 +66,16 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { parseDxf } from './src/dxf.js';
+import { planFolds } from './src/bend.js';
 
 // ---------- 状態 ----------
 let img = null, mode = null;
 let scalePts = [], pxPerMm = null;
 let outline = [], holes = [], holeDia = 14;
-let mesh = null;
+let mesh = null;      // 現在の3Dモデル（平板は Mesh、折り畳み時は Group）
 let dxfGeom = null;   // DXF読込時の {outline, holes, units...}（手動トレースとは別管理）
+let dxfView = null;   // DXFプレビューの座標変換（クリック→mm 逆変換に使用）
+let bends = [], bendPending = null;   // 曲げ線（canvas座標で保持）
 
 const cv = document.getElementById('draw');
 const ctx = cv.getContext('2d');
@@ -189,12 +193,17 @@ function drawDxfPreview(g){
     hole.forEach((p,i)=> i?ctx.lineTo(tx(p[0]),ty(p[1])):ctx.moveTo(tx(p[0]),ty(p[1])));
     ctx.closePath(); ctx.stroke();
   }
+  dxfView = { minX, minY, s, margin, H: cv.height };   // クリック→mm 逆変換用に保存
+  drawBends();
 }
 
 // ---------- モード切替 ----------
 function setMode(m){
+  if(dxfGeom && (m==='scale'||m==='outline'||m==='holes')){
+    setStatus('DXFでは①②③は不要（外形・穴は自動抽出済み）。使えるのは ④曲げ です。'); return;
+  }
   mode = m;
-  for(const id of ['mScale','mOutline','mHoles']) document.getElementById(id).classList.remove('on');
+  for(const id of ['mScale','mOutline','mHoles','mBend']) document.getElementById(id).classList.remove('on');
   if(m==='scale'){ document.getElementById('mScale').classList.add('on'); scalePts=[]; setStatus('①スケール: 既知寸法の両端を2点クリック。'); }
   if(m==='outline'){ document.getElementById('mOutline').classList.add('on'); setStatus('②輪郭: 板の角を順にクリック。角を全部クリックしたら「3D生成」へ。'); }
   if(m==='holes'){
@@ -203,11 +212,16 @@ function setMode(m){
     if(d) holeDia = parseFloat(d);
     setStatus(`③穴: 穴の中心をクリック（直径${holeDia}mm）。別径は一旦この値で置き、後で変更可。`);
   }
-  redraw();
+  if(m==='bend'){
+    document.getElementById('mBend').classList.add('on'); bendPending = null;
+    setStatus('④曲げ: 曲げ線の両端を2点クリック → 角度と向き(山/谷)を入力。平行な複数曲げ(L/コの字/Z/ハット)に対応。');
+  }
+  redrawCurrent();
 }
 document.getElementById('mScale').onclick   = () => setMode('scale');
 document.getElementById('mOutline').onclick = () => setMode('outline');
 document.getElementById('mHoles').onclick   = () => setMode('holes');
+document.getElementById('mBend').onclick    = () => setMode('bend');
 
 // ---------- クリック ----------
 function canvasXY(e){
@@ -215,8 +229,22 @@ function canvasXY(e){
   return { x:(e.clientX-r.left)*(cv.width/r.width), y:(e.clientY-r.top)*(cv.height/r.height) };
 }
 cv.addEventListener('click', e => {
-  if(!img) return;
+  if(!img && !dxfGeom) return;
   const p = canvasXY(e);
+  if(mode==='bend'){                       // 曲げ線（画像・DXF 両対応）
+    if(!bendPending){ bendPending = p; setStatus('曲げ線の2点目をクリック。'); }
+    else {
+      const ang = parseFloat(prompt('曲げ角度（度）。例 90', '90'));
+      const ds = (prompt('向き: 山=u / 谷=d（既定 u）', 'u') || 'u').trim().toLowerCase();
+      const dir = ds.startsWith('d') ? -1 : 1;
+      if(ang > 0) bends.push({ p1:bendPending, p2:p, angle:ang, dir });
+      bendPending = null;
+      setStatus(`曲げ線を追加（計${bends.length}本）。続けて追加 or 「3D生成 ▶」で折り曲げ。`);
+    }
+    redrawCurrent();
+    return;
+  }
+  if(!img) return;                         // 以降（スケール/輪郭/穴）は画像トレース専用
   if(mode==='scale'){
     scalePts.push(p);
     if(scalePts.length===2){
@@ -236,17 +264,18 @@ cv.addEventListener('click', e => {
 
 // ---------- 戻る/クリア ----------
 document.getElementById('undo').onclick = () => {
-  if(mode==='outline') outline.pop();
+  if(mode==='bend'){ if(bendPending) bendPending = null; else bends.pop(); }
+  else if(mode==='outline') outline.pop();
   else if(mode==='holes') holes.pop();
   else if(mode==='scale') scalePts.pop();
-  redraw();
+  redrawCurrent();
 };
-function resetTrace(){ scalePts=[]; pxPerMm=null; outline=[]; holes=[]; mode=null;
-  for(const id of ['mScale','mOutline','mHoles']) document.getElementById(id).classList.remove('on'); }
+function resetTrace(){ scalePts=[]; pxPerMm=null; outline=[]; holes=[]; bends=[]; bendPending=null; mode=null;
+  for(const id of ['mScale','mOutline','mHoles','mBend']) document.getElementById(id).classList.remove('on'); }
 document.getElementById('clear').onclick = () => {
   if(dxfGeom){
-    dxfGeom = null;
-    if(mesh){ scene.remove(mesh); mesh.geometry.dispose(); mesh = null; }
+    dxfGeom = null; bends = []; bendPending = null;
+    clearModel();
     ctx.clearRect(0,0,cv.width,cv.height);
     cv.hidden = true; document.getElementById('drop').style.display = '';
     setStatus('クリアしました。図面（画像 or DXF）を読み込んでください。');
@@ -273,8 +302,21 @@ function redraw(){
   ctx.strokeStyle='#e0413a'; ctx.lineWidth=2;
   holes.forEach(h=>{ const r = pxPerMm? h.d/2*pxPerMm : 5;
     ctx.beginPath(); ctx.arc(h.x,h.y,r,0,Math.PI*2); ctx.stroke(); dot(h,'#e0413a'); });
+  drawBends();
 }
 function dot(p,c){ ctx.fillStyle=c; ctx.beginPath(); ctx.arc(p.x,p.y,3.5,0,Math.PI*2); ctx.fill(); }
+
+// 曲げ線オーバーレイ（canvas座標。画像・DXF どちらの上にも描く）
+function drawBends(){
+  if(!bends.length && !bendPending) return;
+  ctx.save(); ctx.setLineDash([8,5]); ctx.lineWidth=2; ctx.strokeStyle='#8a4bf0';
+  for(const b of bends){ ctx.beginPath(); ctx.moveTo(b.p1.x,b.p1.y); ctx.lineTo(b.p2.x,b.p2.y); ctx.stroke(); }
+  ctx.restore();
+  for(const b of bends){ dot(b.p1,'#8a4bf0'); dot(b.p2,'#8a4bf0'); }
+  if(bendPending) dot(bendPending,'#8a4bf0');
+}
+// 現在モードに応じて2Dを再描画
+function redrawCurrent(){ if(img) redraw(); else if(dxfGeom) drawDxfPreview(dxfGeom); }
 
 // ---------- three.js ----------
 const tcv = document.getElementById('three');
@@ -304,18 +346,61 @@ function toMM(){
   const ox = Math.min(...xs), oy = Math.max(...ys);      // 原点=左下, y上向き
   const out = outline.map(p=>[ (p.x-ox)/pxPerMm, (oy-p.y)/pxPerMm ]);
   const hl  = holes.map(h=>({ x:(h.x-ox)/pxPerMm, y:(oy-h.y)/pxPerMm, d:h.d }));
-  return { out, hl };
+  const bm  = bends.map(b=>({
+    p1:[ (b.p1.x-ox)/pxPerMm, (oy-b.p1.y)/pxPerMm ],
+    p2:[ (b.p2.x-ox)/pxPerMm, (oy-b.p2.y)/pxPerMm ],
+    angleDeg:b.angle, dir:b.dir }));
+  return { out, hl, bm };
 }
-// Shape を押し出してメッシュ化（手動・DXF 共通）
-function buildMesh(shape, thk){
-  const geo = new THREE.ExtrudeGeometry(shape, {depth:thk, bevelEnabled:false});
-  if(mesh){ scene.remove(mesh); mesh.geometry.dispose(); }
-  const mat = new THREE.MeshStandardMaterial({color:0x9aa6b2, metalness:0.25, roughness:0.6, side:THREE.DoubleSide});
-  mesh = new THREE.Mesh(geo, mat); scene.add(mesh);
-  fitCamera(mesh);
+function dxfCanvasToMM(p){                               // DXFプレビュー上のクリック→mm
+  const v = dxfView;
+  return [ v.minX + (p.x - v.margin)/v.s, v.minY + (v.H - v.margin - p.y)/v.s ];
+}
+function holeCircleToPoly(h, segs=48){                   // 折り曲げ時は穴も多角形化
+  const pts=[];
+  for(let i=0;i<segs;i++){ const a=i/segs*2*Math.PI; pts.push([ h.x + h.d/2*Math.cos(a), h.y + h.d/2*Math.sin(a) ]); }
+  return pts;
+}
+function shiftToOrigin(outl, hls, bnd){                  // 原点寄せ（外形/穴/曲げを同じだけ平行移動）
+  let minX=Infinity,minY=Infinity; for(const [x,y] of outl){ if(x<minX)minX=x; if(y<minY)minY=y; }
+  const T=([x,y])=>[x-minX,y-minY];
+  return { outline:outl.map(T), holes:hls.map(h=>h.map(T)),
+           bends:bnd.map(b=>({p1:T(b.p1), p2:T(b.p2), angleDeg:b.angleDeg, dir:b.dir})) };
 }
 
-// DXF（mm座標）→ THREE.Shape（原点寄せ：グリッド基準合わせ＆巨大座標の精度対策）
+// 既存モデル（Mesh / Group）を破棄
+function clearModel(){
+  if(!mesh) return;
+  scene.remove(mesh);
+  if(mesh.geometry) mesh.geometry.dispose();
+  if(mesh.traverse) mesh.traverse(o=>{ if(o.geometry) o.geometry.dispose(); });
+  mesh = null;
+}
+const plateMat = () => new THREE.MeshStandardMaterial({color:0x9aa6b2, metalness:0.25, roughness:0.6, side:THREE.DoubleSide});
+
+// Shape を押し出してメッシュ化（平板：手動・DXF 共通）
+function buildMesh(shape, thk){
+  clearModel();
+  const geo = new THREE.ExtrudeGeometry(shape, {depth:thk, bevelEnabled:false});
+  mesh = new THREE.Mesh(geo, plateMat()); scene.add(mesh); fitCamera(mesh);
+}
+// 折り畳み：各パネルを押し出し→行列で配置（Group）
+function buildFolded(panels, thk){
+  clearModel();
+  const group = new THREE.Group();
+  for(const pan of panels){
+    if(!pan.poly || pan.poly.length<3) continue;
+    const shape = new THREE.Shape();
+    pan.poly.forEach((p,i)=> i?shape.lineTo(p[0],p[1]):shape.moveTo(p[0],p[1]));
+    for(const h of pan.holes){ const path=new THREE.Path(); h.forEach((p,i)=> i?path.lineTo(p[0],p[1]):path.moveTo(p[0],p[1])); shape.holes.push(path); }
+    const geo = new THREE.ExtrudeGeometry(shape, {depth:thk, bevelEnabled:false});
+    geo.applyMatrix4(new THREE.Matrix4().set(...pan.matrix));   // row-major で受け取り
+    group.add(new THREE.Mesh(geo, plateMat()));
+  }
+  mesh = group; scene.add(group); fitCamera(group);
+}
+
+// DXF（mm座標）→ THREE.Shape（原点寄せ）
 function shapeFromDxf(g){
   let minX=Infinity, minY=Infinity;
   for(const [x,y] of g.outline){ if(x<minX)minX=x; if(y<minY)minY=y; }
@@ -334,21 +419,35 @@ function generateFromDxf(){
 }
 
 document.getElementById('gen').onclick = () => {
+  const thk = parseFloat(document.getElementById('thk').value)||2.3;
   if(dxfGeom){
-    const thk = parseFloat(document.getElementById('thk').value)||2.3;
-    generateFromDxf();
-    setStatus(`DXFから3D生成OK（外形${dxfGeom.outline.length}点・穴${dxfGeom.holes.length}個・板厚${thk}mm）。右画面をドラッグで回転。`);
+    if(bends.length){
+      const bm = bends.map(b=>({ p1:dxfCanvasToMM(b.p1), p2:dxfCanvasToMM(b.p2), angleDeg:b.angle, dir:b.dir }));
+      const sh = shiftToOrigin(dxfGeom.outline, dxfGeom.holes, bm);
+      const { panels, warnings } = planFolds({outline:sh.outline, holes:sh.holes}, sh.bends);
+      buildFolded(panels, thk);
+      setStatus(`DXF＋曲げで3D生成OK（パネル${panels.length}・板厚${thk}mm）${warnings.length?' ／ '+warnings.join('、'):''}`);
+    } else {
+      generateFromDxf();
+      setStatus(`DXFから3D生成OK（外形${dxfGeom.outline.length}点・穴${dxfGeom.holes.length}個・板厚${thk}mm）。右画面をドラッグで回転。`);
+    }
     return;
   }
   if(!pxPerMm){ setStatus('先に①スケールを設定してください。'); return; }
   if(outline.length<3){ setStatus('②輪郭を3点以上クリックしてください。'); return; }
-  const thk = parseFloat(document.getElementById('thk').value)||2.3;
-  const { out, hl } = toMM();
-  const shape = new THREE.Shape();
-  out.forEach((p,i)=> i?shape.lineTo(p[0],p[1]):shape.moveTo(p[0],p[1]));
-  hl.forEach(h=>{ const path=new THREE.Path(); path.absarc(h.x,h.y,h.d/2,0,Math.PI*2,true); shape.holes.push(path); });
-  buildMesh(shape, thk);
-  setStatus(`3D生成OK（輪郭${out.length}点・穴${hl.length}個・板厚${thk}mm）。右画面をドラッグで回転。`);
+  const { out, hl, bm } = toMM();
+  if(bends.length){
+    const holePolys = hl.map(h=>holeCircleToPoly(h));
+    const { panels, warnings } = planFolds({outline:out, holes:holePolys}, bm);
+    buildFolded(panels, thk);
+    setStatus(`曲げ込みで3D生成OK（パネル${panels.length}・穴${hl.length}・板厚${thk}mm）${warnings.length?' ／ '+warnings.join('、'):''}`);
+  } else {
+    const shape = new THREE.Shape();
+    out.forEach((p,i)=> i?shape.lineTo(p[0],p[1]):shape.moveTo(p[0],p[1]));
+    hl.forEach(h=>{ const path=new THREE.Path(); path.absarc(h.x,h.y,h.d/2,0,Math.PI*2,true); shape.holes.push(path); });
+    buildMesh(shape, thk);
+    setStatus(`3D生成OK（輪郭${out.length}点・穴${hl.length}個・板厚${thk}mm）。右画面をドラッグで回転。`);
+  }
 };
 
 // ---------- GLB保存 ----------
