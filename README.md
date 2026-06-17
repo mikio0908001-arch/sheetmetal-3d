@@ -20,11 +20,11 @@
 1. このリポを **Code → Codespaces → Create codespace** で起動（ブラウザのVS Code）。
 2. ターミナルで `python3 -m http.server 8000` → 転送ポート8000をプレビュー。
 3. `index.html` を編集 → 保存 → プレビュー更新。
-4. `main` に push すると GitHub Actions が **GitHub Pages へ自動デプロイ**。
+4. `main` に push すると **GitHub Pages が自動で再ビルド・公開**（Deploy from a branch 方式）。
 
 ### 初回だけの設定
-- リポの **Settings → Pages → Build and deployment → Source = GitHub Actions** にする（1回だけ）。
-- 以後は push で自動公開。公開URLは Actions の実行ログ／Settings→Pages に表示。
+- リポの **Settings → Pages → Build and deployment → Source = Deploy from a branch → Branch: `main` / `/(root)`** にする（1回だけ）。
+- 以後は `main` への push で自動公開。公開URLは `https://mikio0908001-arch.github.io/sheetmetal-3d/`（Settings→Pages にも表示）。
 
 ## 設計メモ
 - 3D生成は **three.js の ExtrudeGeometry**（穴あき多角形の押し出し）で**完全にクライアント側**。Python/CADカーネル不要。
