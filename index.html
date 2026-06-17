@@ -52,6 +52,8 @@
   <div class="pane"><canvas id="three"></canvas></div>
 </main>
 
+<!-- TIFF をブラウザ内でデコードする軽量ライブラリ（UMDグローバル UTIF を定義）。図面はサーバに送らない。 -->
+<script src="https://unpkg.com/utif@3.1.0/UTIF.js"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
@@ -74,23 +76,60 @@ const ctx = cv.getContext('2d');
 const statusEl = document.getElementById('status');
 function setStatus(t){ statusEl.textContent = t; }
 
-// ---------- 画像読み込み（TIFはブラウザが表示できない場合があるので注意表示） ----------
+// ---------- 画像読み込み（PNG/JPGはそのまま、TIF/TIFFはUTIFで端末内デコード） ----------
+function setupImage(im){
+  img = im;
+  const maxW = 1100, maxH = 850;
+  let s = Math.min(1, maxW/im.naturalWidth, maxH/im.naturalHeight);
+  cv.width = Math.round(im.naturalWidth*s);
+  cv.height = Math.round(im.naturalHeight*s);
+  cv.hidden = false;
+  document.getElementById('drop').style.display = 'none';
+  resetTrace();
+  redraw();
+  setStatus('読み込み完了。①スケール → 既知寸法の両端を2点クリックしてください。');
+}
+
+function isTiff(f){
+  return /image\/tiff/i.test(f.type||'') || /\.tiff?$/i.test(f.name||'');
+}
+
+// TIF/TIFF をこの端末内だけでPNG相当に変換（UTIF使用・サーバへ送信しない）
+async function loadTiff(f){
+  if(typeof UTIF === 'undefined'){
+    setStatus('TIFデコーダ(UTIF)を読み込めませんでした。ネットワークを確認するか、PNG/JPGでお試しください。');
+    return;
+  }
+  try{
+    setStatus('TIFを変換中…（この端末内だけで処理。サーバには送信しません）');
+    const buf = await f.arrayBuffer();
+    const ifds = UTIF.decode(buf);
+    if(!ifds || !ifds.length) throw new Error('TIFのページが見つかりません');
+    UTIF.decodeImage(buf, ifds[0], ifds);             // 1ページ目をデコード
+    const w = ifds[0].width|0, h = ifds[0].height|0;
+    const rgba = UTIF.toRGBA8(ifds[0]);               // RGBA画素列に変換
+    if(!w || !h || !rgba || !rgba.length) throw new Error('画素を取得できませんでした');
+    const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = h;
+    const tctx = tmp.getContext('2d');
+    const id = tctx.createImageData(w, h); id.data.set(rgba); tctx.putImageData(id, 0, 0);
+    const im = new Image();
+    im.onload = () => {
+      setupImage(im);
+      if(ifds.length > 1) setStatus('読み込み完了（複数ページTIFの1ページ目を表示）。①スケールへ。');
+    };
+    im.onerror = () => setStatus('変換後画像の表示に失敗しました。');
+    im.src = tmp.toDataURL('image/png');              // ＝ ブラウザ内 TIF→PNG 変換
+  }catch(e){
+    setStatus('このTIFは変換できませんでした（CCITT G4等の圧縮は未対応の場合あり）。PNG/JPGに変換してお試しください。 詳細: '+((e&&e.message)||e));
+  }
+}
+
 function loadFile(f){
+  if(isTiff(f)){ loadTiff(f); return; }
   const url = URL.createObjectURL(f);
   const im = new Image();
-  im.onload = () => {
-    img = im;
-    const maxW = 1100, maxH = 850;
-    let s = Math.min(1, maxW/im.naturalWidth, maxH/im.naturalHeight);
-    cv.width = Math.round(im.naturalWidth*s);
-    cv.height = Math.round(im.naturalHeight*s);
-    cv.hidden = false;
-    document.getElementById('drop').style.display = 'none';
-    resetTrace();
-    redraw();
-    setStatus('読み込み完了。①スケール → 既知寸法の両端を2点クリックしてください。');
-  };
-  im.onerror = () => setStatus('この画像形式はブラウザで直接表示できません（TIFはPNG/JPGに変換してお試しください）。');
+  im.onload = () => { setupImage(im); URL.revokeObjectURL(url); };
+  im.onerror = () => setStatus('この画像形式はブラウザで表示できません（PNG/JPGでお試しください）。');
   im.src = url;
 }
 document.getElementById('file').onchange = e => { if(e.target.files[0]) loadFile(e.target.files[0]); };
